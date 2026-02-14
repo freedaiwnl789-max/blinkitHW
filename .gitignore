@@ -7,3 +7,4 @@ product_status.json
 *.tmp
 .DS_Store
 node_modules/
+blinkit_products.xlsx

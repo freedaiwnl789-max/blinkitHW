@@ -255,8 +255,9 @@ class ProductWatcher:
     async def get_cart_product_name(self, page):
         """Extract product name from cart view"""
         try:
-            # Try common cart item selectors
+            # Try common cart item selectors - including DefaultProductCard pattern from Blinkit
             selectors = [
+                "[class*='DefaultProductCard__ProductTitle']",  # Main pattern from Blinkit cart
                 ".cart-item-name",
                 ".product-name",
                 "[data-testid='cart-item-name']",
@@ -264,7 +265,8 @@ class ProductWatcher:
                 ".CartItemCard__ProductName",
                 ".cart-product-title",
                 ".item-name",
-                ".productName"
+                ".productName",
+                "[class*='ProductTitle']"  # Generic product title class
             ]
             
             for sel in selectors:
@@ -272,36 +274,60 @@ class ProductWatcher:
                     script = f"() => {{ const el = document.querySelector('{sel}'); return el ? (el.innerText || el.textContent) : null; }}"
                     text = await page.evaluate(script)
                     if text:
-                        return text.strip()
+                        cleaned = text.strip()
+                        # Avoid returning generic buttons or links
+                        if cleaned and len(cleaned) > 5 and not cleaned.lower() in ['view more details', 'add', 'remove', 'qty']:
+                            return cleaned
                 except Exception:
                     continue
             
             # Try getting product info from cart item container - more flexible approach
             try:
                 script = """() => {
-                    // Try multiple container patterns
-                    const containers = [
-                        ...document.querySelectorAll('[class*="CartItem"]:not([class*="Divider"])'),
-                        ...document.querySelectorAll('[class*="cart-item"]'),
-                        ...document.querySelectorAll('[data-testid*="cart"]'),
-                    ];
+                    // Look for DefaultProductCard containers first (most reliable for Blinkit)
+                    let containers = document.querySelectorAll('[class*="DefaultProductCard__Container"]');
+                    
+                    if (containers.length === 0) {
+                        // Fallback to other cart patterns
+                        containers = [
+                            ...document.querySelectorAll('[class*="CartItem"]:not([class*="Divider"])'),
+                            ...document.querySelectorAll('[class*="cart-item"]'),
+                            ...document.querySelectorAll('[data-testid*="cart"]'),
+                        ];
+                    }
                     
                     if (containers.length > 0) {
                         const container = containers[0];
                         
                         // Try to find product name in various places
-                        // 1. Look for headings
+                        // 1. Look for DefaultProductCard title first (most reliable)
+                        let titleEl = container.querySelector('[class*="DefaultProductCard__ProductTitle"]');
+                        if (titleEl) {
+                            const text = (titleEl.innerText || titleEl.textContent).trim();
+                            if (text && text.length > 5) return text;
+                        }
+                        
+                        // 2. Look for headings
                         let heading = container.querySelector('h1, h2, h3, h4, h5, h6');
-                        if (heading) return (heading.innerText || heading.textContent).trim();
+                        if (heading) {
+                            const text = (heading.innerText || heading.textContent).trim();
+                            if (text && text.length > 5) return text;
+                        }
                         
-                        // 2. Look for text in strong/bold elements
+                        // 3. Look for text in strong/bold elements
                         let strong = container.querySelector('strong, [class*="title"], [class*="name"]');
-                        if (strong) return (strong.innerText || strong.textContent).trim();
+                        if (strong) {
+                            const text = (strong.innerText || strong.textContent).trim();
+                            if (text && text.length > 5) return text;
+                        }
                         
-                        // 3. Get all text and extract first meaningful line
+                        // 4. Get all text and extract first meaningful line
                         let allText = container.innerText || container.textContent;
                         if (allText) {
-                            let lines = allText.split('\\n').filter(l => l.trim().length > 10);
+                            let lines = allText.split('\\n').filter(l => {
+                                const trimmed = l.trim();
+                                return trimmed.length > 10 && !['add', 'remove', 'qty', 'quantity', 'view more details'].includes(trimmed.toLowerCase());
+                            });
                             if (lines.length > 0) return lines[0].trim();
                         }
                     }
@@ -316,12 +342,21 @@ class ProductWatcher:
             # Last resort: try to find any product-related text in the page
             try:
                 script = """() => {
+                    // Look for DefaultProductCard__ProductTitle first (most reliable)
+                    const titleEls = document.querySelectorAll('[class*="DefaultProductCard__ProductTitle"]');
+                    if (titleEls.length > 0) {
+                        const text = (titleEls[0].innerText || titleEls[0].textContent).trim();
+                        if (text && text.length > 5) return text;
+                    }
+                    
                     // Look for any element containing product-like text
-                    const allElements = document.querySelectorAll('[class*="product"], [class*="item"], [class*="cart"]');
+                    const allElements = document.querySelectorAll('[class*="product"], [class*="ProductTitle"], [class*="item"], [class*="cart"]');
                     for (let el of allElements) {
                         const text = (el.innerText || el.textContent || '').trim();
-                        // Look for text that's likely a product name (reasonable length, not just numbers)
-                        if (text.length > 15 && text.length < 500 && !text.match(/^\\d+\\s*(x|\\+|Rs)/i)) {
+                        // Look for text that's likely a product name (reasonable length, not generic words)
+                        if (text.length > 10 && text.length < 500 && 
+                            !['add', 'remove', 'qty', 'quantity', 'view more details'].includes(text.toLowerCase()) &&
+                            !text.match(/^\\d+\\s*(x|\\+|Rs|₹)/i)) {
                             return text.split('\\n')[0].trim();
                         }
                     }
@@ -655,8 +690,8 @@ class ProductWatcher:
                 # - If exact/very close match -> proceed automatically
                 # - If moderate match (>= 0.70) -> proceed automatically without confirmation
                 # - If low match -> abort to avoid wrong purchase
-                if ratio >= 0.70:
-                    logger.info("[AUTO] Good match (similarity >= 0.70) — proceeding automatically")
+                if ratio >= 0.90:
+                    logger.info("[AUTO] Good match (similarity >= 0.90) — proceeding automatically")
                 else:
                     logger.warning("[ABORT] Low-confidence match — aborting auto-purchase to avoid wrong product")
                     self.write_status("available", {"message": "Aborted due to product name mismatch", "product_name": product_name, "similarity": ratio})
@@ -719,12 +754,38 @@ class ProductWatcher:
                 ratio = difflib.SequenceMatcher(None, (self.expected_product_name or "").lower(), (cart_product_name or "").lower()).ratio()
                 logger.info(f"[MATCH] Cart product similarity ratio: {ratio:.2f}")
                 
-                if ratio < 0.70:
+                if ratio < 0.90:
                     logger.warning(f"[MISMATCH] Product in cart does not match expected product!")
+                    logger.info(f"[MISMATCH] Cart product similarity ratio: {ratio:.2f}")
                     logger.warning(f"Expected {colorize_product(self.expected_product_name)} but found {colorize_product(cart_product_name)} (similarity={ratio:.2f})")
                     logger.info("Proceeding to checkout anyway (auto-mode)")
                 else:
                     logger.info(f"[OK] Cart product matches expected product (similarity={ratio:.2f})")
+            
+            logger.info("[SUCCESS] Product successfully added to cart!")
+            print("\n" + "=" * 70)
+            print("✓ PRODUCT ADDED TO CART")
+            print("=" * 70)
+            print(f"Product: {colorize_product(cart_product_name)}")
+            print("=" * 70)
+            
+            # Ask user if they want to continue with automatic checkout
+            automate_checkout = input("\nAutomate checkout steps (Proceed to Pay, Select Payment, Pay Now)? (y/N): ").strip().lower()
+            
+            if automate_checkout not in ('y', 'yes'):
+                logger.info("[USER] User chose not to automate checkout")
+                print("\nManually complete the checkout at your convenience.")
+                print("=" * 70 + "\n")
+                
+                self.write_status("added_to_cart", {
+                    "message": "Product successfully added to cart",
+                    "product_name": cart_product_name,
+                    "added_at": datetime.now().isoformat()
+                })
+                
+                return True
+            
+            logger.info("[USER] User chose to automate checkout steps")
             
             logger.info("Step 4: Clicking on cart button to open cart drawer...")
             # Click on the cart button with class CartButton__Container-sc-1fuy2nj-3 eOczDn
@@ -866,6 +927,7 @@ class ProductWatcher:
         except Exception as e:
             logger.error(f"Auto-purchase error: {e}")
             return False
+
 
 
 async def main():

@@ -68,12 +68,16 @@ class TelegramBot:
         Returns:
             True if successful, False otherwise
         """
+        # Use only Telegram-supported HTML tags (avoid <h1>, etc.)
         message = (
             f"<b>🎉 Product Available!</b>\n\n"
-            f"<b>Product:</b> {product_name}\n"
-            f"<b>Location:</b> {location_name}\n\n"
+            f"<b>Product:</b> {product_name}\n\n"
+            f"📍<b>Location:</b> <b>{location_name}</b>\n\n"
             f"<b>Link:</b>\n"
-            f"<a href='{product_url}'>Open on Blinkit</a>"
+            f"<a href=\"{product_url}\">Open on Blinkit</a>"
         )
-        
-        return await self.send_message(message)
+
+        result = await self.send_message(message)
+        if not result:
+            logger.warning("Telegram notification failed — check bot token, channel id, and that the bot is added to the channel/group.")
+        return result

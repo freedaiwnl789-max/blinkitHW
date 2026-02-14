@@ -1,0 +1,10 @@
+playwright>=1.40.0
+
+# Notes:
+# 1) After installing, run: playwright install
+# 2) Use a virtual environment (recommended):
+#    python -m venv .venv
+#    .\.venv\Scripts\Activate.ps1  (Windows PowerShell)
+#    pip install -r requirements.txt
+#    playwright install
+# 3) The watcher uses only standard library modules + Playwright. No extra third-party packages required.

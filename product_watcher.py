@@ -14,6 +14,11 @@ import os
 import difflib
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (specify absolute path)
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # Platform-specific sound alert
 if sys.platform == "win32":
@@ -23,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.auth import BlinkitAuth
 from src.order.blinkit_order import BlinkitOrder
+from src.telegram.service import TelegramBot
 
 # Status file location
 STATUS_FILE = Path("product_status.json")
@@ -133,7 +139,7 @@ logger = logging.getLogger(__name__)
 
 
 class ProductWatcher:
-    def __init__(self, product_url, latitude, longitude, check_interval=30, location_label="Home", continue_on_out_of_stock=False):
+    def __init__(self, product_url, latitude, longitude, check_interval=30, location_label="Home", continue_on_out_of_stock=False, telegram_bot_token=None, telegram_channel_id=None):
         """
         Initialize the product watcher
         
@@ -144,6 +150,8 @@ class ProductWatcher:
             check_interval: Time between checks in seconds
             location_label: Saved address label to select (default 'Home')
             continue_on_out_of_stock: Keep monitoring if product goes out of stock (default False)
+            telegram_bot_token: Telegram bot token for notifications
+            telegram_channel_id: Telegram channel ID for notifications
         """
         self.product_url = product_url
         self.latitude = latitude
@@ -158,6 +166,11 @@ class ProductWatcher:
         self.location_label = location_label or "Home"
         # Continue refreshing if product goes out of stock
         self.continue_on_out_of_stock = continue_on_out_of_stock
+        
+        # Telegram bot configuration
+        self.telegram_bot = None
+        if telegram_bot_token and telegram_channel_id:
+            self.telegram_bot = TelegramBot(telegram_bot_token, telegram_channel_id)
 
     def extract_product_id(self, url):
         """Extract product ID from URL"""
@@ -622,6 +635,12 @@ class ProductWatcher:
         try:
             logger.info("Step 1: Verifying product details before adding to cart...")
             
+            # Check if telegram bot is configured
+            if self.telegram_bot:
+                logger.info(f"[INFO] Telegram bot is configured and ready")
+            else:
+                logger.info(f"[INFO] Telegram bot is NOT configured")
+            
             # Verify we have the correct product on screen using fuzzy matching
             product_name = await self.get_product_title(self.order.page)
             logger.info(f"[VERIFY] Product on screen: {colorize_product(product_name)}")
@@ -669,6 +688,25 @@ class ProductWatcher:
                 await self.order.page.click("text=My Cart")
                 await asyncio.sleep(2)
                 logger.info("[OK] Cart opened")
+            
+            # Send Telegram notification immediately after cart is opened
+            if self.telegram_bot:
+                logger.info("Step 3a: Sending Telegram notification...")
+                product_name = self.expected_product_name or "Unknown Product"
+                
+                try:
+                    telegram_success = await self.telegram_bot.send_product_notification(
+                        product_name=product_name,
+                        product_url=self.product_url,
+                        location_name=self.location_label
+                    )
+                    
+                    if telegram_success:
+                        logger.info("[OK] Telegram notification sent successfully")
+                    else:
+                        logger.warning("[WARN] Telegram notification failed to send")
+                except Exception as e:
+                    logger.error(f"[ERROR] Telegram notification error: {e}")
             
             logger.info("Step 3b: Verifying product in cart...")
             # Extract product name from cart and verify it matches expected product
@@ -869,13 +907,30 @@ async def main():
     # Ask if user wants to keep monitoring even if product goes out of stock
     continue_on_oos = input("\nContinue refreshing if product goes out of stock? (y/N): ").strip().lower() in ('y', 'yes')
 
+    # Load Telegram credentials from environment variables
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    telegram_channel_id = os.getenv("TELEGRAM_CHANNEL_ID")
+
     logger.info(f"Product URL: {product_url}")
     logger.info(f"Location: using site-saved address ('{location_label}') via UI")
     logger.info(f"Check interval: {check_interval} seconds")
     logger.info(f"Continue on out-of-stock: {'YES - will keep refreshing' if continue_on_oos else 'NO - will stop'}")
+    if telegram_bot_token and telegram_channel_id:
+        logger.info(f"Telegram notifications: ENABLED (Channel: {telegram_channel_id})")
+    else:
+        logger.info("Telegram notifications: DISABLED (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID in .env)")
 
     # Start watching (no coordinates provided — watcher will try to select given saved address)
-    watcher = ProductWatcher(product_url, None, None, check_interval, location_label, continue_on_oos)
+    watcher = ProductWatcher(
+        product_url, 
+        None, 
+        None, 
+        check_interval, 
+        location_label, 
+        continue_on_oos,
+        telegram_bot_token=telegram_bot_token,
+        telegram_channel_id=telegram_channel_id
+    )
     success = await watcher.watch(max_checks=None)  # Infinite checks
     
     if success:

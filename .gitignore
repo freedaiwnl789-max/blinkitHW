@@ -8,3 +8,8 @@ product_status.json
 .DS_Store
 node_modules/
 blinkit_products.xlsx
+zepto_chromium_data/
+zepto_cookies.json
+zepto_status.json
+hot-wheels-urls.json
+hot-wheels-urls.txt

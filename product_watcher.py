@@ -139,7 +139,7 @@ logger = logging.getLogger(__name__)
 
 
 class ProductWatcher:
-    def __init__(self, product_url, latitude, longitude, check_interval=30, location_label="Home", continue_on_out_of_stock=False, telegram_bot_token=None, telegram_channel_id=None):
+    def __init__(self, product_url, latitude, longitude, check_interval=30, location_label="Home", continue_on_out_of_stock=False, telegram_bot_token=None, telegram_channel_id=None, automate_checkout=False):
         """
         Initialize the product watcher
         
@@ -152,6 +152,7 @@ class ProductWatcher:
             continue_on_out_of_stock: Keep monitoring if product goes out of stock (default False)
             telegram_bot_token: Telegram bot token for notifications
             telegram_channel_id: Telegram channel ID for notifications
+            automate_checkout: If True, automatically proceed with checkout steps (default False)
         """
         self.product_url = product_url
         self.latitude = latitude
@@ -166,11 +167,29 @@ class ProductWatcher:
         self.location_label = location_label or "Home"
         # Continue refreshing if product goes out of stock
         self.continue_on_out_of_stock = continue_on_out_of_stock
+        # Automatically proceed with checkout steps
+        self.automate_checkout = automate_checkout
         
         # Telegram bot configuration
         self.telegram_bot = None
         if telegram_bot_token and telegram_channel_id:
             self.telegram_bot = TelegramBot(telegram_bot_token, telegram_channel_id)
+        
+        # Event to signal retry request from Telegram button
+        self.telegram_retry_event = asyncio.Event()
+        self.telegram_cancel_event = asyncio.Event()
+        
+        # Store original parameters for retry functionality
+        self.original_params = {
+            "product_url": product_url,
+            "latitude": latitude,
+            "longitude": longitude,
+            "check_interval": check_interval,
+            "location_label": location_label,
+            "continue_on_out_of_stock": continue_on_out_of_stock,
+            "telegram_bot_token": telegram_bot_token,
+            "telegram_channel_id": telegram_channel_id
+        }
 
     def extract_product_id(self, url):
         """Extract product ID from URL"""
@@ -571,6 +590,25 @@ class ProductWatcher:
             logger.info(f"[OK] Location set to: Lat {self.latitude}, Lon {self.longitude}")
             self.order = BlinkitOrder(self.auth.page)
             
+            # Start Telegram polling if configured
+            if self.telegram_bot:
+                logger.info("[TELEGRAM] Starting polling for button callbacks...")
+                
+                # Register callback handlers
+                async def on_retry():
+                    logger.info("[TELEGRAM] Retry button clicked - will restart watch after current action")
+                    self.telegram_retry_event.set()
+                
+                async def on_cancel():
+                    logger.info("[TELEGRAM] Cancel button clicked - stopping watch")
+                    self.telegram_cancel_event.set()
+                
+                self.telegram_bot.register_callback("retry_watch", on_retry)
+                self.telegram_bot.register_callback("cancel_watch", on_cancel)
+                
+                # Start polling in background
+                self.telegram_bot.polling_task = asyncio.create_task(self.telegram_bot.start_polling())
+            
         except Exception as e:
             logger.error(f"Failed to initialize: {e}")
             return False
@@ -583,6 +621,12 @@ class ProductWatcher:
         
         try:
             while True:
+                # Check if cancel was requested via Telegram button
+                if self.telegram_cancel_event.is_set():
+                    logger.info("[TELEGRAM] Cancel requested - stopping watch")
+                    self.write_status("stopped", {"reason": "Cancelled via Telegram"})
+                    return False
+                
                 if max_checks and check_num >= max_checks:
                     logger.info(f"Max checks ({max_checks}) reached. Stopping.")
                     self.write_status("stopped", {"reason": "Max checks reached"})
@@ -618,7 +662,7 @@ class ProductWatcher:
                             logger.error("[ABORT] Stopping due to product going out of stock")
                             self.write_status("out_of_stock", {
                                 "message": "Product went out of stock",
-                                "product_name": self.expected_product_name,
+                                "product_nam e": self.expected_product_name,
                                 "timestamp": datetime.now().isoformat()
                             })
                             return False
@@ -657,6 +701,10 @@ class ProductWatcher:
             return False
         
         finally:
+            # Stop Telegram polling if running
+            if self.telegram_bot and self.telegram_bot.is_polling:
+                await self.telegram_bot.stop_polling()
+            
             if self.auth:
                 try:
                     if hasattr(self.auth, 'close'):
@@ -724,26 +772,7 @@ class ProductWatcher:
                 await asyncio.sleep(2)
                 logger.info("[OK] Cart opened")
             
-            # Send Telegram notification immediately after cart is opened
-            if self.telegram_bot:
-                logger.info("Step 3a: Sending Telegram notification...")
-                product_name = self.expected_product_name or "Unknown Product"
-                
-                try:
-                    telegram_success = await self.telegram_bot.send_product_notification(
-                        product_name=product_name,
-                        product_url=self.product_url,
-                        location_name=self.location_label
-                    )
-                    
-                    if telegram_success:
-                        logger.info("[OK] Telegram notification sent successfully")
-                    else:
-                        logger.warning("[WARN] Telegram notification failed to send")
-                except Exception as e:
-                    logger.error(f"[ERROR] Telegram notification error: {e}")
-            
-            logger.info("Step 3b: Verifying product in cart...")
+            logger.info("Step 3a: Verifying product in cart...")
             # Extract product name from cart and verify it matches expected product
             cart_product_name = await self.get_cart_product_name(self.order.page)
             logger.info(f"[CART] Product in cart: {colorize_product(cart_product_name)}")
@@ -762,6 +791,27 @@ class ProductWatcher:
                 else:
                     logger.info(f"[OK] Cart product matches expected product (similarity={ratio:.2f})")
             
+            # Send Telegram notification only after product is verified to be correct
+            if self.telegram_bot:
+                logger.info("Step 3b: Sending Telegram notification with action buttons...")
+                product_name = self.expected_product_name or cart_product_name or "Unknown Product"
+                
+                try:
+                    telegram_success = await self.telegram_bot.send_product_notification(
+                        product_name=product_name,
+                        product_url=self.product_url,
+                        location_name=self.location_label,
+                        with_buttons=True
+                    )
+                    
+                    if telegram_success:
+                        logger.info("[OK] Telegram notification with buttons sent successfully")
+                        logger.info("[INFO] User can now click 'Retry' button to restart the watch process")
+                    else:
+                        logger.warning("[WARN] Telegram notification failed to send")
+                except Exception as e:
+                    logger.error(f"[ERROR] Telegram notification error: {e}")
+            
             logger.info("[SUCCESS] Product successfully added to cart!")
             print("\n" + "=" * 70)
             print("✓ PRODUCT ADDED TO CART")
@@ -769,12 +819,11 @@ class ProductWatcher:
             print(f"Product: {colorize_product(cart_product_name)}")
             print("=" * 70)
             
-            # Ask user if they want to continue with automatic checkout
-            automate_checkout = input("\nAutomate checkout steps (Proceed to Pay, Select Payment, Pay Now)? (y/N): ").strip().lower()
-            
-            if automate_checkout not in ('y', 'yes'):
-                logger.info("[USER] User chose not to automate checkout")
+            # Check if user wants to automate checkout
+            if not self.automate_checkout:
+                logger.info("[USER] Automate checkout disabled - waiting for manual completion or Telegram callback")
                 print("\nManually complete the checkout at your convenience.")
+                print("Awaiting Telegram callback (Retry/Cancel) or manual completion...")
                 print("=" * 70 + "\n")
                 
                 self.write_status("added_to_cart", {
@@ -783,9 +832,29 @@ class ProductWatcher:
                     "added_at": datetime.now().isoformat()
                 })
                 
+                # Wait for Telegram callbacks (retry or cancel)
+                # Check every 5 seconds for Telegram events
+                max_wait_time = 600  # 10 minutes max wait
+                elapsed = 0
+                
+                while elapsed < max_wait_time:
+                    # Check if user clicked Retry button
+                    if self.telegram_retry_event.is_set():
+                        logger.info("[TELEGRAM] Retry button clicked - restarting watch")
+                        return False
+                    
+                    # Check if user clicked Cancel button
+                    if self.telegram_cancel_event.is_set():
+                        logger.info("[TELEGRAM] Cancel button clicked - stopping watch")
+                        return False
+                    
+                    await asyncio.sleep(5)
+                    elapsed += 5
+                
+                logger.info("[INFO] Max wait time reached - assuming manual payment completion")
                 return True
             
-            logger.info("[USER] User chose to automate checkout steps")
+            logger.info("[USER] Proceeding with automated checkout steps")
             
             logger.info("Step 4: Clicking on cart button to open cart drawer...")
             # Click on the cart button with class CartButton__Container-sc-1fuy2nj-3 eOczDn
@@ -810,6 +879,14 @@ class ProductWatcher:
             
             if not cart_button_clicked:
                 logger.warning("Could not click cart button")
+            
+            # Check for Telegram retry/cancel interrupts
+            if self.telegram_cancel_event.is_set():
+                logger.info("[TELEGRAM] Cancel requested - stopping checkout")
+                return False
+            if self.telegram_retry_event.is_set():
+                logger.info("[TELEGRAM] Retry requested - aborting checkout")
+                return False
             
             logger.info("Step 5: Clicking Proceed to pay button to go to checkout...")
             
@@ -859,6 +936,14 @@ class ProductWatcher:
             await asyncio.sleep(2)
             current_url = self.order.page.url
             logger.info(f"Current page URL: {current_url}")
+            
+            # Check for Telegram retry/cancel interrupts before payment
+            if self.telegram_cancel_event.is_set():
+                logger.info("[TELEGRAM] Cancel requested - stopping before payment")
+                return False
+            if self.telegram_retry_event.is_set():
+                logger.info("[TELEGRAM] Retry requested - aborting checkout before payment")
+                return False
 
             logger.info("Step 6: Selecting Cash payment method...")
             # Try common selectors for Cash / COD payment option
@@ -888,6 +973,14 @@ class ProductWatcher:
 
             if not cash_clicked:
                 logger.warning("Could not automatically select Cash payment option")
+            
+            # Check for Telegram retry/cancel interrupts before final payment
+            if self.telegram_cancel_event.is_set():
+                logger.info("[TELEGRAM] Cancel requested - stopping before paying")
+                return False
+            if self.telegram_retry_event.is_set():
+                logger.info("[TELEGRAM] Retry requested - aborting before payment")
+                return False
 
             logger.info("Step 7: Clicking Pay Now button...")
             # Try to click Pay Now / Pay now button
@@ -914,9 +1007,18 @@ class ProductWatcher:
 
             if not pay_clicked:
                 logger.warning("Pay button not found — please complete payment manually on the checkout page")
-                # Give user some time to complete manual payment
+                # Give user some time to complete manual payment, but check for Telegram interrupts every 5 seconds
                 logger.info("Waiting 120 seconds for you to complete payment manually...")
-                await asyncio.sleep(120)
+                for wait_iteration in range(24):  # 24 * 5 = 120 seconds
+                    # Check for Telegram retry/cancel before continuing wait
+                    if self.telegram_cancel_event.is_set():
+                        logger.info("[TELEGRAM] Cancel requested - stopping during manual payment wait")
+                        return False
+                    if self.telegram_retry_event.is_set():
+                        logger.info("[TELEGRAM] Retry requested - aborting manual payment wait")
+                        return False
+                    
+                    await asyncio.sleep(5)  # Wait 5 seconds before next check
             else:
                 logger.info("Payment button clicked; waiting briefly for confirmation...")
                 await asyncio.sleep(5)
@@ -969,6 +1071,9 @@ async def main():
     # Ask if user wants to keep monitoring even if product goes out of stock
     continue_on_oos = input("\nContinue refreshing if product goes out of stock? (y/N): ").strip().lower() in ('y', 'yes')
 
+    # Ask if user wants to automate checkout steps (ask once, applies to all retries)
+    automate_checkout = input("\nAutomate checkout steps (Proceed to Pay, Select Payment, Pay Now)? (y/N): ").strip().lower() in ('y', 'yes')
+
     # Load Telegram credentials from environment variables
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     telegram_channel_id = os.getenv("TELEGRAM_CHANNEL_ID")
@@ -977,28 +1082,65 @@ async def main():
     logger.info(f"Location: using site-saved address ('{location_label}') via UI")
     logger.info(f"Check interval: {check_interval} seconds")
     logger.info(f"Continue on out-of-stock: {'YES - will keep refreshing' if continue_on_oos else 'NO - will stop'}")
+    logger.info(f"Automate checkout: {'YES - will auto proceed through checkout' if automate_checkout else 'NO - will stop after adding to cart'}")
     if telegram_bot_token and telegram_channel_id:
         logger.info(f"Telegram notifications: ENABLED (Channel: {telegram_channel_id})")
     else:
         logger.info("Telegram notifications: DISABLED (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID in .env)")
 
-    # Start watching (no coordinates provided — watcher will try to select given saved address)
-    watcher = ProductWatcher(
-        product_url, 
-        None, 
-        None, 
-        check_interval, 
-        location_label, 
-        continue_on_oos,
-        telegram_bot_token=telegram_bot_token,
-        telegram_channel_id=telegram_channel_id
-    )
-    success = await watcher.watch(max_checks=None)  # Infinite checks
-    
-    if success:
-        logger.info("\n[SUCCESS] Product purchased successfully!")
-    else:
-        logger.info("\n[INFO] Watcher stopped. Product not yet available.")
+    # Run watcher in a loop to support retry via Telegram
+    retry_count = 0
+    while True:
+        logger.info(f"\n{'='*70}")
+        if retry_count > 0:
+            logger.info(f"RETRY #{retry_count} - Starting new watch cycle with same parameters")
+        logger.info(f"{'='*70}\n")
+        
+        # Start watching (no coordinates provided — watcher will try to select given saved address)
+        watcher = ProductWatcher(
+            product_url, 
+            None, 
+            None, 
+            check_interval, 
+            location_label, 
+            continue_on_oos,
+            telegram_bot_token=telegram_bot_token,
+            telegram_channel_id=telegram_channel_id,
+            automate_checkout=automate_checkout
+        )
+        success = await watcher.watch(max_checks=None)  # Infinite checks
+        
+        if success:
+            logger.info("\n[SUCCESS] Product purchased successfully!")
+            break
+        else:
+            logger.info("\n[INFO] Watcher stopped.")
+            
+            # Check if Telegram Retry button was clicked
+            if watcher.telegram_retry_event.is_set():
+                logger.info("[TELEGRAM] Retry button clicked - automatically restarting watch cycle")
+                retry_count += 1
+                logger.info(f"Restarting watch cycle (Retry #{retry_count})...")
+                watcher.telegram_retry_event.clear()  # Clear the event for next cycle
+                await asyncio.sleep(2)  # Brief pause before restart
+                continue
+            
+            # Check if Telegram Cancel button was clicked
+            if watcher.telegram_cancel_event.is_set():
+                logger.info("[TELEGRAM] Cancel button clicked - exiting")
+                watcher.telegram_cancel_event.clear()
+                break
+            
+            # Otherwise, ask user if they want to retry (terminal fallback)
+            retry_choice = input("\nWould you like to retry watching this product? (y/N): ").strip().lower()
+            if retry_choice in ('y', 'yes'):
+                retry_count += 1
+                logger.info(f"Restarting watch cycle (Retry #{retry_count})...")
+                await asyncio.sleep(2)  # Brief pause before restart
+                continue
+            else:
+                logger.info("User chose not to retry. Exiting.")
+                break
 
 
 if __name__ == "__main__":
